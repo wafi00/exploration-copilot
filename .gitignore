@@ -1,0 +1,8 @@
+.ipynb_checkpoints/
+__pycache__/
+app_backup.py
+*.csv
+*.las
+*.sgy
+*.segy
+*.xlsx
