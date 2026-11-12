@@ -1,8 +1,24 @@
-.ipynb_checkpoints/
-__pycache__/
-app_backup.py
+# Competition data and results never go to GitHub
+*.pkl
+*.npy
+*.png
+*.jpg
 *.csv
+*.json
 *.las
-*.sgy
+*.LAS
 *.segy
-*.xlsx
+*.sgy
+*.SEGY
+*.SGY
+*.ipynb
+master/
+copilot/
+app_feedback/
+teamC_traps/
+uploads/
+knowledge/
+screenshots/
+# Python and Jupyter clutter
+__pycache__/
+.ipynb_checkpoints/

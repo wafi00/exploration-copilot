@@ -1,54 +1,61 @@
-# \# Exploration Copilot
+# Exploration Copilot
 
-# 
+APGCE 2026 GeoHackathon, Challenge 1.
 
-# AI geoscience copilot for APGCE 2026 GeoHackathon (Challenge 1).
+An AI geoscientist that classifies hydrocarbon traps as **structural, stratigraphic or combination** from
+measured evidence, says **how much to trust itself**, **debates itself** (structural vs stratigraphic advocate,
+judged by a chief geoscientist), **finds untested look-alike traps** across the whole survey, and **ranks
+leads by risked area** (chance of gas from a blind look-back x area). Every answer cites numbered evidence
+([E4], [V2]) and ends with what a geoscientist should check.
 
-# Chat screen (Streamlit) + Gemma 4 LLM hosted on the DUG HPC.
+## Architecture
 
-# 
+1. **Notebook pipeline** (`copilot_pipeline.py`, `copilot_extras.py`, `copilot_traps2.py`, `copilot_survey.py`):
+   well deviation, well-seismic tie, sands and contacts from the logs, auto-picked horizons, two-point trap
+   test, whole-survey look-alike screen, blind look-back.
+2. **`master/` folder**: one verdict per well, numbered evidence files, leads, survey look-alikes, pictures,
+   cached demo answers (made on the HPC; competition data, not in this repo).
+3. **`copilot_api.py`**: the only interface between the app and the data / AI (ask, chat, debate,
+   similar_to, followup, ask_section, trap_examples, image_test).
+4. **`app.py`** (Streamlit) + **Gemma 4** served with vLLM on the HPC.
+   Sections: Field overview, Well copilot, Where else?, Leads to mature, How we checked the AI,
+   Seismic viewer (`seismic_tab.py`, using `plots.py`, `viewer.py`, `seismic_ai.py`).
 
-# \## Files
+Gemma's weights are not changed: the copilot learns **in context** (Team B's reasoning steps, field
+calibration, trap catalogue and worked examples on every request; Team C's labelled trap images as
+examples).
 
-# \- `app.py` – chat screen
+## How to run (on the HPC)
 
-# \- `llm.py` – sends questions to Gemma (only works inside the HPC)
+```bash
+pip install -r requirements.txt
+export GEMMA_URL="http://<vllm-host>:8000/v1"      # the competition's Gemma endpoint
+# 1. run the notebook pipeline cells once (they write the master/ folder)
+# 2. start the app
+python -m streamlit run app.py --server.port 8603
+```
+Keep **Demo mode** on for a live demo: cached answers appear instantly.
 
-# 
+## QC and validation
 
-# \## Run on a laptop (chat screen only, placeholder answers)
+- **Well ties** with checkshots and the sand pattern; wells placed at reservoir depth (deviation).
+- **Two-point trap test**: every survey body is tested from two points; only calls that agree are kept.
+- **Blind look-back** calibrates the chance of gas used to rank leads.
+- **Rule-based kill checklist**: fixed geoscience rules in code, not AI, decide what rejects a lead.
+- **Two confidences**: evidence quality vs trap type; the AI may not exceed the trust level.
+- **Blind test mode** hides the human interpretation for test wells.
+- **Human in the loop**: Agree / Disagree feedback on every AI answer.
 
-# 1\. Install Python (tick "Add Python to PATH").
+## Limits
 
-# 2\. Open Command Prompt and run:
+- Thin pays under about 10 m are below seismic reliability.
+- No sonic or density logs, so ties use the sand pattern.
+- Image-only answers (uploaded seismic) stay at MEDIUM confidence at most.
+- `AI_Chat.py` and `pages/` are the earlier prototype; `app.py` is the submitted app.
 
-# &#x20;  python -m pip install streamlit openai
+## Team
 
-# 3\. Go to the project folder:
-
-# &#x20;  cd exploration-copilot
-
-# 4\. Start the app:
-
-# &#x20;  python -m streamlit run app.py
-
-# 5\. The browser opens at http://localhost:8501. Press Ctrl+C in Command Prompt to stop.
-
-# 
-
-# \## Run on the HPC (real Gemma answers)
-
-# 1\. Copy app.py and llm.py into the team folder on the HPC.
-
-# 2\. pip install --user streamlit openai
-
-# 3\. streamlit run app.py --server.port 8601
-
-# 4\. Open http://localhost:8601 in Firefox inside RustDesk.
-
-# 
-
-# \## Rules
-
-# \- No competition data in this repo (code only). Data stays on the HPC.
-
+<!-- Fill in: name - role -->
+- Team A (code): ...
+- Team B (interpretation): ...
+- Team C (trap image library): ...

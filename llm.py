@@ -1,6 +1,7 @@
+import os
 import openai
 
-client = openai.OpenAI(base_url="http://172.28.34.1:8000/v1", api_key="token-not-needed")
+client = openai.OpenAI(base_url=os.environ.get("GEMMA_URL", "http://<vllm-host>:8000/v1"), api_key="token-not-needed")
 MODEL = "google/gemma-4-26B-A4B-it"
 
 def ask(system, user, temperature=0.3):
@@ -14,7 +15,7 @@ def ask(system, user, temperature=0.3):
 import base64
 import openai
 
-_img_client = openai.OpenAI(base_url="http://172.28.34.1:8000/v1", api_key="token-not-needed")
+_img_client = openai.OpenAI(base_url=os.environ.get("GEMMA_URL", "http://<vllm-host>:8000/v1"), api_key="token-not-needed")
 
 def ask_with_image(system, question, image_bytes, mime="image/png"):
     b64 = base64.b64encode(image_bytes).decode()

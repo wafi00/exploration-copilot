@@ -145,19 +145,35 @@ def _views_png(il_pack, xl_pack, slice_pack, point, spots=()):
     return buf.getvalue()
 
 
+def _section_messages(api, image, question, desc, evidence, history, examples):
+    """Same messages as CopilotAPI.ask_section (so the answer can stream)."""
+    history = [h for h in (history or []) if h.get("content")]
+    first_q = history[0]["content"] if history else question
+    content = api._example_parts(examples)
+    content.append({"type": "text", "text": f"DISPLAY: {desc or 'seismic section'}\n\nEVIDENCE:\n"
+                                            f"{evidence or 'none (image only)'}\n\nQUESTION: {first_q}"})
+    content.append(api._img_any(image))
+    msgs = [{"role": "system", "content": api.SYSTEM_SECTION}, {"role": "user", "content": content}]
+    if history:
+        msgs += [{"role": h["role"], "content": h["content"]} for h in history[1:]]
+        msgs.append({"role": "user", "content": question})
+    return msgs
+
+
 CAND_RULE = ("\n\nAt the very end, add one line that starts with CANDIDATES: followed by a JSON list of features "
              "you identified on panel B or C, in the same format as before, or CANDIDATES: []")
 
 
-def render(api):
+def render(api, feedback=None, live=None):
     ss = st.session_state
     ss.setdefault("extra_paths", [])
     ss.setdefault("lab_chat", [])      # {"role", "content" (shown), "sent" (sent to the AI), "cands"}
     ss.setdefault("cands", [])
     ss.setdefault("spots", [])
 
+    ss.setdefault("lab_on", True)
     if not st.toggle("Open the seismic viewer", key="lab_on",
-                     help="Reads seismic only when switched on, so the other tabs stay fast."):
+                     help="Switch off to stop reading seismic."):
         st.caption("Switch on to explore the seismic volumes and ask the AI about any point. "
                    "The first view can take up to a minute to load.")
         return
@@ -267,7 +283,8 @@ def render(api):
             st.slider("Crosslines", xl_lo, xl_hi, step=xl_step, key="crop_xl")
             st.slider("Time window (ms)", t0, t1, step=dt, key="crop_t")
             if wells is not None and len(wells):
-                st.number_input("Margin around wells (lines)", 5, 400, 40, 5, key="crop_margin")
+                ss.setdefault("crop_margin", 40)
+                st.number_input("Margin around wells (lines)", 5, 400, step=5, key="crop_margin")
                 st.button("Crop to the wells", on_click=crop_to_wells, use_container_width=True)
             st.button("Show the whole survey", on_click=reset_crop, use_container_width=True)
 
@@ -443,6 +460,10 @@ def render(api):
                         ss.time_jump = mid_t
                         st.rerun()
 
+    if feedback and len(ss.lab_chat) >= 2 and ss.lab_chat[-1]["role"] == "assistant":
+        feedback("Seismic viewer", f"{vol} IL {il_used} XL {xl_used} {t_used:.0f} ms",
+                 ss.lab_chat[-2]["content"], ss.lab_chat[-1]["content"])
+
     if ss.lab_chat and st.button("New conversation", key="lab_new"):
         ss.lab_chat, ss.cands, ss.spots = [], [], []
         st.rerun()
@@ -487,10 +508,24 @@ def render(api):
             try:
                 png = _views_png(il_pack, xl_pack, slice_pack, point, spots_now)
                 history = [{"role": m["role"], "content": m["sent"]} for m in ss.lab_chat]   # earlier turns only
-                raw =api.ask_section(png, sent, desc, evidence, history=history or None, examples=examples)
-            except Exception:
-                st.error("The AI is busy right now. Please try again in a moment.")
+            except Exception as e:
+                st.error(f"Couldn't draw the picture for the AI: {e}")
                 return
+        try:
+            if live is not None:
+                with st.chat_message("user"):
+                    st.markdown(q)
+                with st.chat_message("assistant"):
+                    raw = live(lambda img: _section_messages(api, png, sent, desc, evidence, history, examples),
+                               lambda: api.ask_section(png, sent, desc, evidence, history=history or None,
+                                                       examples=examples),
+                               max_tokens=1400, hide="CANDIDATES:")
+            else:
+                with st.spinner("The AI is looking at the map and both sections..."):
+                    raw = api.ask_section(png, sent, desc, evidence, history=history or None, examples=examples)
+        except Exception:
+            st.error("The AI is busy right now. Please try again in a moment.")
+            return
 
         answer, cands = split_candidates(raw, (il_pos[0], il_pos[-1]), (xl_pos[0], xl_pos[-1]), (ts[0], ts[-1]))
         start = len(ss.cands)
