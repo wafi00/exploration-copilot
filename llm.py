@@ -28,6 +28,7 @@ def ask_with_image(system, question, image_bytes, mime="image/png"):
             ]},
         ],
         temperature=0.3,
+        max_tokens=900,
     )
     return r.choices[0].message.content
 
@@ -36,7 +37,7 @@ MODEL = "google/gemma-4-26B-A4B-it"
 
 def _stream(messages):
     stream = _img_client.chat.completions.create(
-        model=MODEL, messages=messages, temperature=0.3, stream=True
+        model=MODEL, messages=messages, temperature=0.3, max_tokens=900, stream=True
     )
     for chunk in stream:
         if chunk.choices and chunk.choices[0].delta.content:
