@@ -20,6 +20,8 @@ if LAB_DIR not in sys.path:
 import plots
 from plots import (seismic_inline_range, crossline_range, get_section, sample_times,
                    wells_on_seismic, nearest_lines, read_well_list, il_xl_to_xy)
+import plotly.graph_objects as go
+from viewer import _thin
 from viewer import (section_figure, map_figure, birdseye_figure, aerial_figure,
                     add_candidate_boxes, add_findings_to_map)
 from seismic_ai import (save_upload, list_all_seismic, scan_bright_spots, build_prompt,
@@ -42,9 +44,16 @@ def _times(path):
     return sample_times(path)
 
 
+MAP_POINTS = 20000          # top-view points sent to the browser (was 40,000)
+
+
 @st.cache_data(max_entries=20)
 def _cropped_slice(path, time_ms, il_rng, xl_rng):
-    return crop_slice(path, time_ms, il_rng, xl_rng)
+    pack, pts = crop_slice(path, time_ms, il_rng, xl_rng, max_points=MAP_POINTS)
+    if pts is not None:                                     # smaller numbers = smaller message to the browser
+        pts = {k: (np.asarray(v, np.float32) if k in ("x", "y", "v") else
+                   np.asarray(v, np.int32) if k in ("il", "xl") else v) for k, v in pts.items()}
+    return pack, pts
 
 
 @st.cache_data(max_entries=4)
@@ -158,6 +167,154 @@ def _section_messages(api, image, question, desc, evidence, history, examples):
         msgs += [{"role": h["role"], "content": h["content"]} for h in history[1:]]
         msgs.append({"role": "user", "content": question})
     return msgs
+
+
+BRIGHT_SCALE = [[0, "#FFE066"], [0.5, "#FF8C1A"], [1, "#E8112D"]]    # yellow -> orange -> red
+SAND_SCALE = [[0, "#7BE495"], [1, "#0B7A3E"]]                       # light -> dark green
+
+
+def _sand_volume():
+    """The competition's sand-probability inversion volume, if there is one."""
+    try:
+        for name, p in plots.list_seismic().items():
+            if "sandprob" in name.lower().replace("_", "").replace(" ", ""):
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def _bright_cut(values, pct):
+    a = np.abs(np.asarray(values, float))
+    a = a[np.isfinite(a)]
+    return float(np.percentile(a, 100 - pct)) if a.size else np.inf
+
+
+def _overlay_section(fig, data, pos, ts, keep, colorscale, zmin, zmax, name):
+    """Transparent everywhere except where keep is True (NaN cells are not drawn)."""
+    z = np.where(keep, data, np.nan)
+    z, x, y = _thin(z, pos, ts)
+    fig.add_trace(go.Heatmap(z=z, x=x, y=y, colorscale=colorscale, zmin=zmin, zmax=zmax, showscale=False,
+                             opacity=0.8, hoverinfo="skip", name=name))
+    return fig
+
+
+SEC_W, SEC_H = 1000, 700     # picture size of a section (pixels); plenty for a half-screen panel
+
+
+def _resample(a, ys_src, xs_src, ys_dst, xs_dst):
+    """Nearest-neighbour: put array a (rows = ys_src, cols = xs_src) onto the ys_dst / xs_dst grid."""
+    ri = np.clip(np.searchsorted(ys_src, ys_dst), 0, len(ys_src) - 1)
+    ci = np.clip(np.searchsorted(xs_src, xs_dst), 0, len(xs_src) - 1)
+    out = a[np.ix_(ri, ci)].astype(float)
+    off = (xs_dst < xs_src[0]) | (xs_dst > xs_src[-1])
+    out[:, off] = np.nan
+    offr = (ys_dst < ys_src[0]) | (ys_dst > ys_src[-1])
+    out[offr, :] = np.nan
+    return out
+
+
+def _paint(rgb, value, keep, scale, vmin, vmax, alpha=0.8):
+    """Blend a colour scale into rgb where keep is True."""
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("s", [c for _, c in scale])
+    keep = keep & np.isfinite(value)
+    if not keep.any():
+        return rgb
+    t = np.clip((value - vmin) / ((vmax - vmin) or 1.0), 0, 1)
+    col = cmap(np.nan_to_num(t))[..., :3]
+    rgb[keep] = (1 - alpha) * rgb[keep] + alpha * col[keep]
+    return rgb
+
+
+def fast_section(data, pos, ts, title, xlabel, colours="Grey", wells=(), cross_at=None, cross_label="",
+                 time_line=None, sand_pack=None, bright_pct=None, sand_cut=0.5):
+    """A section sent as ONE compressed picture instead of hundreds of thousands of numbers.
+    Same look as viewer.section_figure; highlights are painted into the picture."""
+    import base64
+    from matplotlib import colormaps
+    from PIL import Image
+    rs, cs = max(1, int(np.ceil(data.shape[0] / SEC_H))), max(1, int(np.ceil(data.shape[1] / SEC_W)))
+    d, x, y = data[::rs, ::cs].astype(float), pos[::cs], ts[::rs]
+    clip = float(np.nanpercentile(np.abs(data), 98)) or 1.0
+    norm = np.clip((np.nan_to_num(d) + clip) / (2 * clip), 0, 1)
+    rgb = colormaps["Greys" if colours == "Grey" else "RdBu"](norm)[..., :3]
+    if sand_pack is not None:
+        sd, sp, st_, _ = sand_pack
+        sv = _resample(np.asarray(sd, float), np.asarray(st_, float), np.asarray(sp, float), y.astype(float), x.astype(float))
+        rgb = _paint(rgb, sv, sv >= sand_cut, SAND_SCALE, sand_cut, 1.0)
+    if bright_pct:
+        a = np.abs(d)
+        cut = _bright_cut(data, bright_pct)
+        rgb = _paint(rgb, a, a >= cut, BRIGHT_SCALE, cut, float(np.nanmax(np.abs(data))), alpha=0.85)
+    # small crops: enlarge block by block (not smoothed) so the browser shows crisp traces
+    ky, kx = max(1, 500 // rgb.shape[0]), max(1, 700 // rgb.shape[1])
+    if ky > 1 or kx > 1:
+        rgb = np.repeat(np.repeat(rgb, ky, axis=0), kx, axis=1)
+    buf = io.BytesIO()
+    Image.fromarray((rgb * 255).astype(np.uint8)).save(buf, format="JPEG", quality=88)
+    src = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    dx = float(x[1] - x[0]) if len(x) > 1 else 1.0
+    dy = float(y[1] - y[0]) if len(y) > 1 else 1.0
+    # light invisible grid so hovering still shows position, time and amplitude
+    hs, hc = max(1, data.shape[0] // 120), max(1, data.shape[1] // 160)
+    fig = go.Figure(go.Heatmap(z=np.round(data[::hs, ::hc], 3), x=pos[::hc], y=ts[::hs], opacity=0, showscale=False,
+                               hovertemplate=f"{xlabel}: %{{x}}<br>TWT: %{{y}} ms<br>Amplitude: %{{z:.3g}}<extra></extra>"))
+    # the seismic picture, stretched to fill the axes (a layout image keeps the panel's normal shape)
+    fig.add_layout_image(dict(source=src, xref="x", yref="y", x=float(x[0]) - dx / 2, y=float(y[0]) - dy / 2,
+                              sizex=float(x[-1] - x[0]) + dx, sizey=float(y[-1] - y[0]) + dy, sizing="stretch",
+                              xanchor="left", yanchor="top", layer="below"))
+    for name, p in wells:
+        fig.add_vline(x=p, line=dict(color="orange", width=1.5, dash="dot"), annotation_text=name,
+                      annotation_position="top", annotation_font_color="orange")
+    if cross_at is not None:
+        fig.add_vline(x=cross_at, line=dict(color="#4DA3FF", width=1.5), annotation_text=cross_label,
+                      annotation_position="bottom")
+    if time_line is not None:
+        fig.add_hline(y=time_line, line=dict(color="yellow", width=1.5))
+    fig.update_xaxes(title=xlabel, range=[float(x[0]) - dx / 2, float(x[-1]) + dx / 2], showgrid=False)
+    fig.update_yaxes(title="TWT (ms)", range=[float(y[-1]) + dy / 2, float(y[0]) - dy / 2], showgrid=False)
+    fig.update_layout(title=title, height=620, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def _highlight_section(fig, data, pos, ts, sand_pack, bright_pct, sand_cut):
+    """Sand (green) then bright amplitudes (yellow-red) on a section; the base seismic stays underneath.
+    Bright = the strongest bright_pct % of THIS section (each view uses its own cut-off)."""
+    cut_b = _bright_cut(data, bright_pct) if bright_pct else None
+    if sand_pack is not None:
+        sd, sp, st_, _ = sand_pack
+        fig = _overlay_section(fig, sd, sp, st_, sd >= sand_cut, SAND_SCALE, sand_cut, 1.0, "Sand probability")
+    if cut_b is not None:
+        a = np.abs(data)
+        fig = _overlay_section(fig, a, pos, ts, a >= cut_b, BRIGHT_SCALE, cut_b, float(np.nanmax(a)),
+                               "Bright amplitudes")
+    n_new = (sand_pack is not None) + (cut_b is not None)
+    if n_new:                                          # keep wells, lines and the cross on top
+        d = fig.data
+        fig.data = d[:1] + d[-n_new:] + d[1:-n_new]
+    return fig
+
+
+def _overlay_points(fig, pts, keep, values, colorscale, zmin, zmax, size, name):
+    """Extra coloured squares on the top view, just above the seismic (under lines, wells and the star)."""
+    if not np.any(keep):
+        return fig
+    fig.add_trace(go.Scattergl(x=pts["x"][keep], y=pts["y"][keep], mode="markers", name=name, hoverinfo="skip",
+                               marker=dict(color=values[keep], colorscale=colorscale, cmin=zmin, cmax=zmax,
+                                           size=size, symbol="square")))
+    fig.data = (fig.data[0], fig.data[-1]) + tuple(fig.data[1:-1])
+    return fig
+
+
+def _overlay_grid(fig, grid, uil, uxl, keep, colorscale, zmin, zmax, name):
+    rs, cs = max(1, grid.shape[0] // 500), max(1, grid.shape[1] // 500)
+    z = np.where(keep, grid, np.nan)[::rs, ::cs]
+    fig.add_trace(go.Heatmap(z=z, x=uxl[::cs], y=uil[::rs], colorscale=colorscale, zmin=zmin, zmax=zmax,
+                             showscale=False, opacity=0.9, hoverinfo="skip", name=name))
+    fig.data = (fig.data[0], fig.data[-1]) + tuple(fig.data[1:-1])
+    return fig
 
 
 CAND_RULE = ("\n\nAt the very end, add one line that starts with CANDIDATES: followed by a JSON list of features "
@@ -299,7 +456,6 @@ def render(api, feedback=None, live=None):
         with st.expander("Display settings", expanded=False):
             dot = st.slider("Top view: dot size", 2, 12, 5)
             z_stretch = st.slider("Aerial view: wall height", 0.2, 1.5, 0.5, 0.1)
-            colours = st.radio("Colours", ["Grey", "Red-Blue"], horizontal=True)
             sensitivity = st.slider("Bright-spot sensitivity (lower = finds more)", 1.2, 5.0, 2.0, 0.1)
 
     il, xl, map_t = ss.il, ss.xl, ss.map_t
@@ -344,6 +500,44 @@ def render(api, feedback=None, live=None):
         if cropped:
             st.info(f"Cropped to inlines {crop_il[0]}-{crop_il[1]}, crosslines {crop_xl[0]}-{crop_xl[1]}, "
                     f"{crop_t[0]}-{crop_t[1]} ms. Change it under Crop area.")
+        # ----- Colour highlights -----
+        sand_path = _sand_volume() if _is_competition(path) else None
+        with st.container(border=True):
+            h1, h2, h3 = st.columns([1.2, 1.2, 1])
+            with h1:
+                hl_bright = st.toggle("Highlight bright amplitudes", key="hl_bright",
+                                      help="Strongest reflections in yellow-red: possible gas, must be checked.")
+                if hl_bright:
+                    ss.setdefault("hl_pct", 3)
+                    st.slider("Strongest % of amplitudes", 1, 10, key="hl_pct")
+            with h2:
+                hl_sand = st.toggle("Show sand probability", key="hl_sand", disabled=sand_path is None,
+                                    help=("Green where the inversion says sand." if sand_path else
+                                          "Only for the competition volumes (needs the sand-probability inversion)."))
+                if hl_sand and sand_path:
+                    ss.setdefault("hl_sand_cut", 0.5)
+                    st.slider("Sand probability above", 0.3, 0.9, step=0.05, key="hl_sand_cut")
+            with h3:
+                ss.setdefault("lab_colours", "Grey")
+                colours = st.radio("Seismic colours", ["Grey", "Red-Blue"], horizontal=True, key="lab_colours")
+            legend = []
+            if hl_bright:
+                legend.append(f"**Yellow-red** = strongest {ss.hl_pct}% of amplitudes in each view (possible gas, must be checked)")
+            if hl_sand and sand_path:
+                legend.append(f"**Green** = sand probability above {ss.hl_sand_cut:.2f}")
+            if legend:
+                st.caption(" · ".join(legend) + ". Shown on the top view and both sections.")
+
+        sand_il = sand_xl = sand_pts = sand_slice = None
+        if hl_sand and sand_path:
+            try:
+                sand_il = crop_section(_section(sand_path, "inline", il), crop_xl, crop_t)
+                sand_xl = crop_section(_section(sand_path, "crossline", xl), crop_il, crop_t)
+                sand_slice, sand_pts = _cropped_slice(sand_path, map_t, crop_il, crop_xl)
+            except Exception:
+                st.caption("Sand probability isn't available at this position.")
+        cut_b = _bright_cut(pts["v"] if pts is not None else slice_pack[0], ss.hl_pct) if hl_bright else None
+
         view = st.radio("View", ["Top view", "Aerial view (3D)"], horizontal=True,
                         label_visibility="collapsed", key="lab_view")
         top = view == "Top view"
@@ -356,6 +550,15 @@ def render(api, feedback=None, live=None):
         if top and cf is not None and pts is not None:
             fig = birdseye_figure(pts, to_xy([il, il], crop_xl), to_xy(crop_il, [xl, xl]),
                                   tuple(float(v) for v in to_xy(il, xl)), wxy, il, xl, colours, dot)
+            # each overlay is slotted in just above the seismic, so add bright first to keep it on top of sand
+            if cut_b is not None:
+                av = np.abs(np.asarray(pts["v"], float))
+                fig = _overlay_points(fig, pts, av >= cut_b, av, BRIGHT_SCALE, cut_b, float(np.nanmax(av)),
+                                      dot, "Bright amplitudes")
+            if sand_pts is not None:
+                sv = np.asarray(sand_pts["v"], float)
+                fig = _overlay_points(fig, sand_pts, sv >= ss.hl_sand_cut, sv, SAND_SCALE, ss.hl_sand_cut, 1.0,
+                                      dot, "Sand probability")
             fig = add_findings_to_map(fig, spots_now, ss.cands, cf)
             st.caption("Click anywhere on the map to move there. The red star is the point the AI is asked about.")
             event = st.plotly_chart(fig, use_container_width=True, key="lab_top",
@@ -370,8 +573,16 @@ def render(api, feedback=None, live=None):
         elif top:
             st.caption("This volume has no real-world X/Y in its headers, so the map is in inline/crossline numbers.")
             grid, uil, uxl, _ = slice_pack
-            event = st.plotly_chart(map_figure(grid, uil, uxl, t_used, il, xl, colours, wells_in),
-                                    use_container_width=True, key="lab_grid", on_select="rerun",
+            gfig = map_figure(grid, uil, uxl, t_used, il, xl, colours, wells_in)
+            if cut_b is not None:
+                ag = np.abs(grid)
+                gfig = _overlay_grid(gfig, ag, uil, uxl, ag >= cut_b, BRIGHT_SCALE, cut_b, float(np.nanmax(ag)),
+                                     "Bright amplitudes")
+            if sand_slice is not None:
+                sg, su, sx, _ = sand_slice
+                gfig = _overlay_grid(gfig, sg, su, sx, sg >= ss.hl_sand_cut, SAND_SCALE, ss.hl_sand_cut, 1.0,
+                                     "Sand probability")
+            event = st.plotly_chart(gfig, use_container_width=True, key="lab_grid", on_select="rerun",
                                     selection_mode="points")
             sel = event.selection.points if event and event.selection else []
             if sel:
@@ -381,7 +592,8 @@ def render(api, feedback=None, live=None):
                     ss.map_jump = click
                     st.rerun()
         elif cf is not None:
-            st.caption("Drag to rotate, scroll to zoom. Move the slices with the controls on the left.")
+            st.caption("Drag to rotate, scroll to zoom. Move the slices with the controls on the left."
+                       + (" Colour highlights show on the top view and the sections." if (hl_bright or hl_sand) else ""))
             st.plotly_chart(aerial_figure(slice_pack, il_pack, xl_pack, cf, wxy, crop_t, colours, z_stretch),
                             use_container_width=True, key="lab_3d")
         else:
@@ -394,14 +606,16 @@ def render(api, feedback=None, live=None):
 
     left, right = st.columns(2)
     with left:
-        f1 = section_figure(il_data, il_pos, ts, f"Inline {il_used}", "Crossline",
-                            colours, il_wells, xl_used, f"CL {xl_used}", t_used)
+        f1 = fast_section(il_data, il_pos, ts, f"Inline {il_used}", "Crossline", colours, il_wells, xl_used,
+                          f"CL {xl_used}", t_used, sand_il, ss.hl_pct if hl_bright else None,
+                          ss.get("hl_sand_cut", 0.5))
         f1.add_scatter(x=[xl_used], y=[t_used], mode="markers", showlegend=False, hoverinfo="skip",
                        marker=dict(symbol="cross-thin", size=22, line=dict(color="magenta", width=3)))
         st.plotly_chart(add_candidate_boxes(f1, cands_il, "inline"), use_container_width=True)
     with right:
-        f2 = section_figure(xl_data, xl_pos, ts, f"Crossline {xl_used}", "Inline",
-                            colours, xl_wells, il_used, f"IL {il_used}", t_used)
+        f2 = fast_section(xl_data, xl_pos, ts, f"Crossline {xl_used}", "Inline", colours, xl_wells, il_used,
+                          f"IL {il_used}", t_used, sand_xl, ss.hl_pct if hl_bright else None,
+                          ss.get("hl_sand_cut", 0.5))
         f2.add_scatter(x=[il_used], y=[t_used], mode="markers", showlegend=False, hoverinfo="skip",
                        marker=dict(symbol="cross-thin", size=22, line=dict(color="magenta", width=3)))
         st.plotly_chart(add_candidate_boxes(f2, cands_xl, "crossline"), use_container_width=True)

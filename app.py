@@ -19,6 +19,33 @@ IMAGES = os.path.join(MASTER, "images")
 
 st.set_page_config(page_title="Exploration Copilot", layout="wide")
 
+# ---------- Look and feel (cosmetic only) ----------
+st.markdown("""<style>
+.block-container {padding-top: 3.4rem; padding-bottom: 3rem; max-width: 1500px;}
+h1, h2, h3 {letter-spacing: -0.01em;}
+[data-testid="stHeaderActionElements"], h1 a, h2 a, h3 a {display: none !important;}   /* no link icons on headings */
+.ec-hero {padding: 18px 24px; border-radius: 14px; margin-bottom: 6px;
+          background: linear-gradient(120deg, #0B3C49 0%, #0F6E6E 60%, #2A9D8F 100%); color: #fff;}
+.ec-hero h1 {color: #fff; margin: 0; padding: 0; font-size: 2.0rem;}
+.ec-hero p {color: #DDEFEF; margin: 4px 0 0 0; font-size: 1.0rem;}
+.ec-chip {display: inline-block; margin: 10px 6px 0 0; padding: 2px 10px; border-radius: 999px;
+          background: rgba(255,255,255,0.16); color: #fff; font-size: 0.8rem;}
+/* section picker as pill tabs */
+.st-key-nav {margin: 10px 0 6px 0;}
+.st-key-nav [role="radiogroup"] {gap: 8px; flex-wrap: wrap;}
+.st-key-nav [role="radiogroup"] label {margin: 0 !important; padding: 7px 18px !important; border-radius: 999px;
+          border: 1px solid rgba(128,140,150,0.35); background: rgba(128,140,150,0.08); cursor: pointer;}
+.st-key-nav [role="radiogroup"] label:hover {border-color: #2A9D8F;}
+/* hide the radio dots (works with both the older and newer Streamlit layouts) */
+.st-key-nav [role="radiogroup"] label > div:not(:has([data-testid="stMarkdownContainer"])),
+.st-key-nav [role="radiogroup"] label div:has(> [data-testid="stMarkdownContainer"]) > div:not([data-testid="stMarkdownContainer"])
+          {display: none !important;}
+.st-key-nav [role="radiogroup"] label:has(input:checked) {background: #0F6E6E; border-color: #0F6E6E;}
+.st-key-nav [role="radiogroup"] label:has(input:checked) * {color: #fff !important; font-weight: 600;}
+[data-testid="stMetric"] {background: rgba(128,140,150,0.07);}   /* works on light and dark */
+[data-testid="stExpander"] details {border-radius: 10px;}
+</style>""", unsafe_allow_html=True)
+
 
 # ======================================================================
 #                              HELPERS
@@ -39,14 +66,31 @@ def get_api():
     return api
 
 
-@st.cache_data
-def load_demo_answers():
-    path = os.path.join(MASTER, "demo_answers.json")
+DEMO_CACHE = "/data/epic20/APGCE/apgce_team_01/demo_cache.json"     # made by warm_cache.py
+
+
+def _mtime(p):
     try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        return os.path.getmtime(p)
+    except OSError:
+        return 0
+
+
+@st.cache_data
+def _load_demo(_m1, _m2):
+    out = {}
+    for path in (DEMO_CACHE, os.path.join(MASTER, "demo_answers.json")):   # the team's own file wins
+        try:
+            with open(path) as f:
+                out.update({k: v for k, v in json.load(f).items() if not k.startswith("_") and v})
+        except Exception:
+            pass
+    return out
+
+
+def load_demo_answers():
+    """Saved answers for Demo mode: master/demo_answers.json plus demo_cache.json (reloaded when either changes)."""
+    return _load_demo(_mtime(DEMO_CACHE), _mtime(os.path.join(MASTER, "demo_answers.json")))
 
 
 def safe(fn, default=None):
@@ -214,8 +258,13 @@ def run_ai(key, call, demo_key=None, build=None):
     """Button-triggered AI call. Uses the cached demo answer when Demo mode is on.
     With build (a message builder) the answer streams onto the screen as it is written."""
     demo = load_demo_answers()
-    if ss.demo_mode and demo_key and demo_key in demo:
+    keys = demo_key if isinstance(demo_key, (list, tuple)) else [demo_key]
+    demo_key = next((k for k in keys if k and k in demo), None)
+    ss.setdefault("answer_src", {})
+    ss.answer_src.pop(key, None)
+    if ss.demo_mode and demo_key:
         ss.answers[key] = demo[demo_key]
+        ss.answer_src[key] = "saved"
         return
     if build is not None:
         try:
@@ -238,6 +287,11 @@ def run_ai(key, call, demo_key=None, build=None):
                 ss.answers[key] = demo[demo_key]
             else:
                 st.error("The AI is busy right now. Please try again in a moment.")
+
+
+def saved_note(key):
+    if ss.get("answer_src", {}).get(key) == "saved":
+        st.caption("Saved answer (Demo mode). Turn Demo mode off to ask Gemma live.")
 
 
 def follow_up(chat_key, first_q, first_a, send, build=None):
@@ -418,26 +472,31 @@ with st.sidebar:
               help="Shows saved answers instantly for the demo questions. Turn off to ask Gemma live.")
     st.caption("How to use: start on Field overview, pick a well in Well copilot, "
                "then follow Where else? and Leads to mature.")
-    if not load_demo_answers():
-        st.caption("Saved demo answers not available: every question goes to the live AI.")
+    st.caption("Light or dark mode: open the ⋮ menu at the top right and choose a theme.")
+    _n_saved = len(load_demo_answers())
+    st.caption(f"Saved answers ready for Demo mode: {_n_saved}" if _n_saved else
+               "Saved demo answers not available: every question goes to the live AI.")
 
 
 # ======================================================================
 #                              TABS
 # ======================================================================
-st.title("Exploration Copilot")
-st.markdown("An AI geoscientist that reasons from evidence, says how much to trust itself, "
-            "and tells you what to check.")
+_n_wells = len(wells_df) if wells_df is not None else 0
+st.markdown(f"""<div class="ec-hero"><h1>Exploration Copilot</h1>
+<p>An AI geoscientist that reasons from evidence, says how much to trust itself, and tells you what to check.</p>
+<span class="ec-chip">Gemma 4 on the HPC</span><span class="ec-chip">{_n_wells} wells analysed</span>
+<span class="ec-chip">{'Demo mode on' if ss.get('demo_mode', True) else 'Live AI'}</span></div>""",
+            unsafe_allow_html=True)
 
 PAGES = ["Field overview", "Well copilot", "Where else?", "Leads to mature", "How we checked the AI", "Seismic viewer"]
 # Only the chosen tab runs on each click (st.tabs would redraw all six every time, including the seismic).
 # Re-saving the widget values keeps your choices when you switch tabs.
 for _k in ("well_pick", "disc_pick", "lab_on", "vol_pick", "il", "xl", "map_t", "crop_il", "crop_xl", "crop_t",
-           "lab_view", "crop_margin", "lab_teamc"):
+           "lab_view", "crop_margin", "lab_teamc", "hl_bright", "hl_sand", "hl_pct", "hl_sand_cut", "lab_colours"):
     if _k in ss:
         ss[_k] = ss[_k]
-page = st.radio("Section", PAGES, horizontal=True, key="page", label_visibility="collapsed")
-st.divider()
+with st.container(key="nav"):
+    page = st.radio("Section", PAGES, horizontal=True, key="page", label_visibility="collapsed")
 
 # ---------------------------------------------------------------- 1. FIELD OVERVIEW
 if page == "Field overview":
@@ -446,24 +505,31 @@ if page == "Field overview":
     n_look = int((~rejected_mask(survey)).sum()) if len(survey) else "n/a"
     if len(leads) and "lead" in leads.columns:
         top = leads.iloc[0]
-        top_txt = str(top["lead"])
-        top_sub = f"{top['risked_area_km2']:.2f} km² risked" if "risked_area_km2" in leads.columns else None
+        top_txt = str(top["lead"]) + (f"  ·  {top['risked_area_km2']:.2f} km²" if "risked_area_km2" in leads.columns else "")
     else:
-        top_txt, top_sub = "n/a", None
+        top_txt = "n/a"
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Wells analysed", n_wells)
-    m2.metric("Discoveries", n_disc)
-    m3.metric("Undrilled look-alikes found", n_look)
-    m4.metric("Top lead", top_txt, top_sub, delta_color="off")
+    m1.metric("Wells analysed", n_wells, border=True)
+    m2.metric("Discoveries", n_disc, border=True)
+    m3.metric("Undrilled look-alikes found", n_look, border=True)
+    m4.metric("Top lead (risked area)", top_txt, border=True)
 
-    show_image(os.path.join(IMAGES, "survey_bodies.png"),
-               "Whole survey screened in under a minute. Green = drilled discoveries, "
-               "red = undrilled look-alikes.")
+    _l, _c, _r = st.columns([1, 6, 1])
+    with _c:
+        show_image(os.path.join(IMAGES, "survey_bodies.png"),
+                   "Whole survey screened in under a minute. Green = drilled discoveries, "
+                   "red = undrilled look-alikes.")
 
     st.subheader("Verdict for every well")
     table = safe(api.table)
     if table is not None and len(table):
+        nice = {"final_verdict": "Verdict", "status": "Status", "evidence_quality_trust": "Evidence trust",
+                "trap_type_confidence": "Trap-type confidence", "pay_md": "Pay MD", "pay_fluid": "Fluid",
+                "net_gas_m": "Net gas (m)", "net_oil_m": "Net oil (m)", "il": "Inline", "xl": "Crossline",
+                "pay_twt_ms": "Pay time (ms)"}
+        table = table.rename(columns=nice)
+        table.index.name = "Well"
         st.dataframe(styled(table), use_container_width=True)
     else:
         st.info("Verdict table not available.")
@@ -496,8 +562,9 @@ if page == "Well copilot":
                         f"{val(row, 'pay_twt_ms')} ms")
 
         qc = str(val(row, "qc_checks", ""))
-        for check in [c.strip() for c in qc.split(" | ") if c.strip()]:
-            st.warning(check)
+        checks = [c.strip() for c in qc.split(" | ") if c.strip()]
+        if checks:
+            st.warning("**The copilot's own QC warnings**\n" + "\n".join(f"- {c}" for c in checks))
 
         p1, p2 = st.columns(2)
         with p1:
@@ -520,7 +587,8 @@ if page == "Well copilot":
                 asked = free.strip()
 
         if asked:
-            demo_key = f"{well} trap" if asked == QUESTIONS[0] and not blind else None
+            demo_key = ([f"{well} | {asked} | blind"] if blind else
+                        ([f"{well} trap"] if asked == QUESTIONS[0] else []) + [f"{well} | {asked}"])
             run_ai(("well", well, "last"),
                    lambda: api.ask(well, asked, test_mode=blind), demo_key,
                    build=lambda img: api.messages(well, asked, image=img, test_mode=blind))
@@ -533,6 +601,7 @@ if page == "Well copilot":
                 st.markdown(last_q)
             with st.chat_message("assistant"):
                 st.markdown(ans)
+                saved_note(("well", well, "last"))
             feedback_box("Well copilot", well, last_q, ans)
 
             def send_well(q, history):
@@ -556,6 +625,7 @@ if page == "Well copilot":
         if debate:
             with st.container(border=True):
                 st.markdown(debate)
+                saved_note(("debate", well, "debate"))
             feedback_box("Debate", well, "Debate", debate)
             ev =safe(lambda: api.evidence(well, test_mode=blind), "") or ""
             follow_up(f"debate_{well}", "Debate", debate,
@@ -627,6 +697,7 @@ if page == "Where else?":
         if sim:
             with st.container(border=True):
                 st.markdown(sim)
+                saved_note(("where", dw, "similar"))
             feedback_box("Where else?", dw, "Find look-alikes", sim)
             follow_up(f"where_{dw}", "Find look-alikes", sim,
                       lambda q, h: api.followup(sim, q, h),
@@ -663,6 +734,7 @@ if page == "Leads to mature":
     if lead_ans:
         with st.container(border=True):
             st.markdown(lead_ans)
+            saved_note(("leads", "-", "ai"))
         feedback_box("Leads", "-", "Which leads should we mature first?", lead_ans)
         follow_up("leads", "Which leads should we mature first?", lead_ans,
                   lambda q, h: api.followup(lead_ans + "\n\n" + recommendation, q, h),
@@ -698,9 +770,9 @@ if page == "How we checked the AI":
         fb = pd.read_csv(FEEDBACK_CSV)
         n_a, n_d = int((fb.verdict == "Agree").sum()), int((fb.verdict == "Disagree").sum())
         f1, f2, f3 = st.columns(3)
-        f1.metric("Answers reviewed", len(fb))
-        f2.metric("Agree", n_a)
-        f3.metric("Disagree", n_d)
+        f1.metric("Answers reviewed", len(fb), border=True)
+        f2.metric("Agree", n_a, border=True)
+        f3.metric("Disagree", n_d, border=True)
         with st.expander("All feedback"):
             st.dataframe(fb[["time", "tab", "well", "question", "verdict", "comment"]],
                          use_container_width=True, hide_index=True)
@@ -740,9 +812,9 @@ if page == "How we checked the AI":
             acc = res.get("acc", {})
             n0, n1 = acc.get("no_examples"), acc.get("with_examples")
             r1, r2 = st.columns(2)
-            r1.metric("Accuracy without examples", f"{n0:.0%}" if n0 is not None else "n/a")
+            r1.metric("Accuracy without examples", f"{n0:.0%}" if n0 is not None else "n/a", border=True)
             r2.metric("Accuracy with 3 examples", f"{n1:.0%}" if n1 is not None else "n/a",
-                      f"{(n1 - n0) * 100:+.0f} points" if n0 is not None and n1 is not None else None)
+                      f"{(n1 - n0) * 100:+.0f} points" if n0 is not None and n1 is not None else None, border=True)
             T = pd.DataFrame(res.get("table", []))
             cols = [c for c in ["name", "true_label", "no_examples", "with_examples"] if c in T.columns]
             if cols:
