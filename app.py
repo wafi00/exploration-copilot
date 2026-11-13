@@ -53,7 +53,7 @@ h1, h2, h3 {letter-spacing: -0.01em;}
 @st.cache_resource
 def get_api():
     api = CopilotAPI(MASTER)
-    # Team B's knowledge ("training"): add any part that master/knowledge.json is missing (in memory only)
+    # The field knowledge ("training"): add any part that master/knowledge.json is missing (in memory only)
     try:
         import copilot_knowledge as ck
         sp = api.k.get("system_prompt", "")
@@ -166,11 +166,78 @@ ss.setdefault("chats", {})       # conversation key -> list of {"role", "content
 
 MAX_TOKENS = 900          # caps answer length so answers finish sooner
 
+TONES = {
+    "Expert geoscientist": "",
+    "Plain English": "TONE: explain for a non-specialist. Use plain everyday words and short sentences; explain any "
+                     "technical term in brackets the first time. Keep the evidence citations in [brackets].",
+    "Executive summary": "TONE: a short briefing for a manager. At most 5 bullet points. Lead with the decision and "
+                         "what it means for the business. Keep the evidence citations in [brackets].",
+    "Teacher": "TONE: a patient lecturer teaching a geoscience student. Explain the reasoning step by step and what "
+               "each piece of evidence means. Keep the evidence citations in [brackets].",
+    "Quick answer": "TONE: answer in at most 80 words, most important point first. Keep the citations.",
+}
+NAME_RULE = ("Never mention team names such as Team A, Team B or Team C; call their work 'the geoscientist "
+             "interpretation' or 'the labelled examples'.")
+
+
+def tone():
+    return ss.get("tone", "Expert geoscientist")
+
+
+def apply_tone(msgs):
+    """Add the chosen tone (and the no-team-names rule) to the system message, without changing the original."""
+    extra = "\n\n" + NAME_RULE + ("\n" + TONES.get(tone(), "") if TONES.get(tone()) else "")
+    msgs = [dict(m) for m in msgs]
+    if msgs and msgs[0].get("role") == "system" and isinstance(msgs[0].get("content"), str):
+        msgs[0]["content"] += extra
+    else:
+        msgs.insert(0, {"role": "system", "content": extra.strip()})
+    return msgs
+
+
+_NAMES = [("Team C examples", "the labelled examples"), ("Team C images", "the labelled images"),
+          ("Team C's examples", "the labelled examples"), ("Team B interpretation", "geoscientist interpretation"),
+          ("Team A code", "the code"), ("Team B's", "the geoscientists'"), ("Team B’s", "the geoscientists'"), ("TEAM B", "GEOSCIENTIST"),
+          ("Team B", "the geoscientists"), ("Team C's", "the labelled"), ("Team C’s", "the labelled"),
+          ("Team C", "labelled examples"), ("Team A's", "the code's"), ("Team A’s", "the code's"),
+          ("Team A", "the code"), ("teamB_", "geoscientist_"), ("teamC", "examples")]
+
+
+def clean(text):
+    """Replace team names in anything shown to the user (answers, evidence, saved answers)."""
+    if not isinstance(text, str):
+        return text
+    for a, b in _NAMES:
+        text = text.replace(a, b)
+    return text
+
+
+def image_part(upload):
+    """An uploaded picture as a message part for Gemma (resized so the request stays small)."""
+    import base64
+    from PIL import Image
+    im = Image.open(io.BytesIO(upload.getvalue())).convert("RGB")
+    im.thumbnail((1280, 1280))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=88)
+    return {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}}
+
+
+def with_image(msgs, part):
+    """Attach a picture to the last user message."""
+    if part is None:
+        return msgs
+    msgs = [dict(m) for m in msgs]
+    last = msgs[-1]
+    c = last.get("content")
+    last["content"] = (list(c) if isinstance(c, list) else [{"type": "text", "text": str(c)}]) + [part]
+    return msgs
+
 
 def gemma_stream(msgs, temperature=0.2, max_tokens=MAX_TOKENS):
     """Gemma's answer piece by piece, as it is written (same server and model as copilot_api)."""
-    stream = api.client.chat.completions.create(model=capi.GEMMA_MODEL, messages=msgs, temperature=temperature,
-                                                max_tokens=max_tokens, stream=True)
+    stream = api.client.chat.completions.create(model=capi.GEMMA_MODEL, messages=apply_tone(msgs),
+                                                temperature=temperature, max_tokens=max_tokens, stream=True)
     for chunk in stream:
         if chunk.choices:
             d = chunk.choices[0].delta.content
@@ -179,16 +246,23 @@ def gemma_stream(msgs, temperature=0.2, max_tokens=MAX_TOKENS):
 
 
 def _visible(gen, parts, hide=None):
-    """Pass text through to the screen, keeping a copy; stop showing at `hide` (e.g. the CANDIDATES line)."""
+    """Pass text through to the screen, keeping a copy; stop showing at `hide` (e.g. the CANDIDATES line).
+    Team names are replaced as it streams (the last few characters wait until a name can't be cut in half)."""
     shown = 0
+
+    def visible(full, final):
+        cut = full.find(hide) if hide else -1
+        v = clean(full if cut < 0 else full[:cut])
+        return v if (final or cut >= 0) else v[:-12]
     for d in gen:
         parts.append(d)
-        full = "".join(parts)
-        cut = full.find(hide) if hide else -1
-        vis = full if cut < 0 else full[:cut]
+        vis = visible("".join(parts), False)
         if len(vis) > shown:
             yield vis[shown:]
             shown = len(vis)
+    vis = visible("".join(parts), True)
+    if len(vis) > shown:
+        yield vis[shown:]
 
 
 def live_answer(build, fallback, max_tokens=MAX_TOKENS, hide=None, temperature=0.2):
@@ -231,8 +305,8 @@ def build_chat(well, question, history, img, test_mode=False):
 
 
 def _gemma(msgs, temperature, max_tokens):
-    return api.client.chat.completions.create(model=capi.GEMMA_MODEL, messages=msgs, temperature=temperature,
-                                              max_tokens=max_tokens).choices[0].message.content
+    return api.client.chat.completions.create(model=capi.GEMMA_MODEL, messages=apply_tone(msgs),
+                                              temperature=temperature, max_tokens=max_tokens).choices[0].message.content
 
 
 def fast_debate(well):
@@ -262,7 +336,7 @@ def run_ai(key, call, demo_key=None, build=None):
     demo_key = next((k for k in keys if k and k in demo), None)
     ss.setdefault("answer_src", {})
     ss.answer_src.pop(key, None)
-    if ss.demo_mode and demo_key:
+    if ss.demo_mode and demo_key and tone() == "Expert geoscientist":
         ss.answers[key] = demo[demo_key]
         ss.answer_src[key] = "saved"
         return
@@ -303,12 +377,16 @@ def follow_up(chat_key, first_q, first_a, send, build=None):
         ss.chats[chat_key] = msgs
     for m in msgs[2:]:
         with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+            st.markdown(clean(m["content"]))
+            if m.get("img"):
+                st.image(m["img"], width=260)
     if len(msgs) > 2:                                   # feedback on the latest follow-up answer
         feedback_box(f"Follow-up ({chat_key})", chat_key, msgs[-2]["content"], msgs[-1]["content"])
     with st.form(f"form_{chat_key}", clear_on_submit=True):
         q = st.text_input("Follow-up question", placeholder="e.g. Why not structural?",
                           label_visibility="collapsed")
+        pic = st.file_uploader("Add a picture for the AI to look at (optional)", type=["png", "jpg", "jpeg"],
+                               key=f"pic_{chat_key}")
         c1, c2 = st.columns([1, 1])
         sent = c1.form_submit_button("Ask follow-up", use_container_width=True)
         reset = c2.form_submit_button("New conversation", use_container_width=True)
@@ -316,19 +394,28 @@ def follow_up(chat_key, first_q, first_a, send, build=None):
         ss.chats[chat_key] = msgs[:2]
         st.rerun()
     if sent and q.strip():
-        qq, hist = q.strip(), list(msgs)
+        qq, hist = q.strip(), [{"role": m["role"], "content": m["content"]} for m in msgs]
+        part, img_bytes = None, None
+        if pic is not None:
+            try:
+                part, img_bytes = image_part(pic), pic.getvalue()
+            except Exception:
+                st.warning("That picture couldn't be read, so the question is sent without it.")
         with st.chat_message("user"):
             st.markdown(qq)
+            if img_bytes:
+                st.image(img_bytes, width=260)
         try:
             if build is not None:
                 with st.chat_message("assistant"):
-                    a = live_answer(lambda img: build(qq, hist, img), lambda: send(qq, hist))
+                    a = live_answer(lambda img: with_image(build(qq, hist, img), part), lambda: send(qq, hist))
             else:
                 with st.spinner("The AI is thinking..."):
                     a = send(qq, hist)
         except Exception:
             a = "The AI is busy right now. Please try again in a moment."
-        msgs += [{"role": "user", "content": q.strip()}, {"role": "assistant", "content": a}]
+        msgs += [{"role": "user", "content": qq + (" (picture attached)" if img_bytes else ""), "img": img_bytes},
+                 {"role": "assistant", "content": clean(a)}]
         st.rerun()
 
 
@@ -360,6 +447,24 @@ def load_las(name, raw):
         return None
 
 
+def without_evidence(md):
+    """The recommendation as shown to people: the evidence section stays for the AI only."""
+    import re
+    parts = re.split(r"(?m)^(?=#{1,6} )", md)
+    keep = [p for p in parts if not re.match(r"#{1,6} [^\n]*evidence", p, re.I)]
+    return re.sub(r"(?m)^#{1,6} Copilot\s*\n", "", "".join(keep)).strip()
+
+
+def las_summary(df):
+    """P10 / P50 / P90 of each curve, so the AI can comment on the values."""
+    out = []
+    for c in df.columns[:20]:
+        v = pd.to_numeric(df[c], errors="coerce").dropna()
+        if len(v):
+            out.append(f"{c} {v.quantile(0.1):.3g} / {v.quantile(0.5):.3g} / {v.quantile(0.9):.3g}")
+    return "; ".join(out)
+
+
 def las_figure(df, curves, meta):
     """One track per curve, depth increasing downwards."""
     from plotly.subplots import make_subplots
@@ -376,8 +481,6 @@ def las_figure(df, curves, meta):
     return fig
 
 
-TEAMC_DIR = "/data/epic20/APGCE/apgce_team_01/teamC_traps"
-TEAMC_RESULT = "/data/epic20/APGCE/apgce_team_01/app_feedback/teamc_test.json"
 FEEDBACK_CSV = "/data/epic20/APGCE/apgce_team_01/app_feedback/feedback.csv"
 FEEDBACK_COLS = ["time", "tab", "well", "question", "answer", "verdict", "comment"]
 
@@ -463,6 +566,56 @@ def is_dry(w):
     return str(val(well_row(w), "final_verdict", "")).strip().lower() == "dry"
 
 
+def las_section():
+    """LAS upload, curve plot and questions (shown under the Seismic viewer)."""
+    st.subheader("Well logs (LAS)")
+    with st.container(border=True):
+        st.caption("Upload a LAS file to see its curves and ask the AI about them. This is a quick look: the "
+                   "copilot's well verdicts come from the full pipeline (deviation, tie, sands, contacts).")
+        las_up = st.file_uploader("Upload a LAS file", type=["las", "LAS"], key="las_up")
+        if las_up is not None:
+            las_info = load_las(las_up.name, las_up.getvalue())
+            if las_info is None:
+                st.error("Couldn't read this file as LAS.")
+            else:
+                df, meta = las_info
+                curves = [c for c in df.columns]
+                pref = [c for c in PREFERRED_CURVES if c in curves]
+                pick = st.multiselect("Curves to show (up to 6)", curves, default=(pref or curves)[:5],
+                                      max_selections=6, key=f"las_pick_{las_up.name}")
+                st.markdown(f"**{meta['well']}** · depth {meta['start']:g}-{meta['stop']:g} {meta['unit']} · "
+                            f"{len(curves)} curves")
+                if pick:
+                    st.plotly_chart(las_figure(df, pick, meta), use_container_width=True)
+
+                las_ctx = (f"LAS file '{las_up.name}' (displayed only, not interpreted by the pipeline). "
+                           f"Well: {meta['well']}. Depth {meta['start']:g} to {meta['stop']:g} {meta['unit']}, "
+                           f"step {meta['step']}. Curves (name, unit, description): "
+                           + "; ".join(f"{c} ({meta['units'].get(c, '')}, {meta['descr'].get(c, '')})" for c in curves)
+                           + ". Curve summary (P10 / P50 / P90 over the file): " + las_summary(df)
+                           + ". This is a quick look at one file, not the full well-tie pipeline.")
+                las_key = ("las", las_up.name, "ans")
+                lq_cols = st.columns(2)
+                las_q = None
+                for col, text in zip(lq_cols, ["What can these curves tell us about the reservoir?",
+                                               "Which curves are missing for a full interpretation?"]):
+                    if col.button(text, use_container_width=True, key=f"lasq_{text}"):
+                        las_q = text
+                if las_q:
+                    ss.answers[("las", las_up.name, "q")] = las_q
+                    run_ai(las_key, lambda: api.followup(las_ctx, las_q, []),
+                           build=lambda img: build_followup(las_ctx, las_q, []))
+                las_ans = ss.answers.get(las_key)
+                if las_ans:
+                    with st.container(border=True):
+                        st.markdown(clean(las_ans))
+                    feedback_box("LAS viewer", meta["well"], ss.answers.get(("las", las_up.name, "q")), las_ans)
+                    follow_up(f"las_{las_up.name}", ss.answers.get(("las", las_up.name, "q")), las_ans,
+                              lambda q, h: api.followup(las_ctx, q, h),
+                              build=lambda q, h, img: build_followup(las_ctx, q, h))
+
+
+
 # ======================================================================
 #                              SIDEBAR
 # ======================================================================
@@ -470,8 +623,12 @@ with st.sidebar:
     st.markdown("### Exploration Copilot")
     st.toggle("Demo mode", value=True, key="demo_mode",
               help="Shows saved answers instantly for the demo questions. Turn off to ask Gemma live.")
-    st.caption("How to use: start on Field overview, pick a well in Well copilot, "
-               "then follow Where else? and Leads to mature.")
+    st.selectbox("AI tone", list(TONES), key="tone",
+                 help="How the AI talks. Tones other than Expert geoscientist always ask Gemma live.")
+    if tone() != "Expert geoscientist":
+        st.caption("This tone asks Gemma live, so answers take 10 to 30 seconds.")
+    st.caption("How to use: explore the Seismic viewer, see every well in Field overview, ask about one well "
+               "in Well copilot, then follow Similar traps and Leads to mature.")
     st.caption("Light or dark mode: open the ⋮ menu at the top right and choose a theme.")
     _n_saved = len(load_demo_answers())
     st.caption(f"Saved answers ready for Demo mode: {_n_saved}" if _n_saved else
@@ -488,13 +645,15 @@ st.markdown(f"""<div class="ec-hero"><h1>Exploration Copilot</h1>
 <span class="ec-chip">{'Demo mode on' if ss.get('demo_mode', True) else 'Live AI'}</span></div>""",
             unsafe_allow_html=True)
 
-PAGES = ["Field overview", "Well copilot", "Where else?", "Leads to mature", "How we checked the AI", "Seismic viewer"]
+PAGES = ["Seismic viewer", "Field overview", "Well copilot", "Similar traps", "Leads to mature"]
 # Only the chosen tab runs on each click (st.tabs would redraw all six every time, including the seismic).
 # Re-saving the widget values keeps your choices when you switch tabs.
 for _k in ("well_pick", "disc_pick", "lab_on", "vol_pick", "il", "xl", "map_t", "crop_il", "crop_xl", "crop_t",
-           "lab_view", "crop_margin", "lab_teamc", "hl_bright", "hl_sand", "hl_pct", "hl_sand_cut", "lab_colours"):
+           "lab_view", "crop_margin", "lab_examples", "hl_bright", "hl_sand", "hl_pct", "hl_sand_cut", "lab_colours"):
     if _k in ss:
         ss[_k] = ss[_k]
+if ss.get("page") not in PAGES:          # e.g. a section that no longer exists
+    ss.page = PAGES[0]
 with st.container(key="nav"):
     page = st.radio("Section", PAGES, horizontal=True, key="page", label_visibility="collapsed")
 
@@ -546,7 +705,7 @@ if page == "Well copilot":
 
         blind = False
         if well in test_wells:
-            blind = st.toggle("Blind test (hide Team B's interpretation from the AI)", key=f"blind_{well}")
+            blind = st.toggle("Blind test (hide the geoscientist's interpretation from the AI)", key=f"blind_{well}")
 
         # Verdict card
         with st.container(border=True):
@@ -581,17 +740,29 @@ if page == "Well copilot":
         for col, text in zip(qcols, QUESTIONS):
             if col.button(text, use_container_width=True, key=f"q_{well}_{text}"):
                 asked = text
+        free_pic = None
         with st.form(f"free_{well}", clear_on_submit=True):
             free = st.text_input("Your own question", placeholder="Ask anything about this well")
+            free_up = st.file_uploader("Add a picture for the AI to look at (optional)", type=["png", "jpg", "jpeg"],
+                                       key=f"freepic_{well}")
             if st.form_submit_button("Ask") and free.strip():
                 asked = free.strip()
+                free_pic = free_up
 
         if asked:
-            demo_key = ([f"{well} | {asked} | blind"] if blind else
-                        ([f"{well} trap"] if asked == QUESTIONS[0] else []) + [f"{well} | {asked}"])
+            part = None
+            if free_pic is not None:
+                try:
+                    part = image_part(free_pic)
+                except Exception:
+                    st.warning("That picture couldn't be read, so the question is sent without it.")
+            demo_key = None if part else ([f"{well} | {asked} | blind"] if blind else
+                                          ([f"{well} trap"] if asked == QUESTIONS[0] else []) + [f"{well} | {asked}"])
             run_ai(("well", well, "last"),
                    lambda: api.ask(well, asked, test_mode=blind), demo_key,
-                   build=lambda img: api.messages(well, asked, image=img, test_mode=blind))
+                   build=lambda img: with_image(api.messages(well, asked, image=img, test_mode=blind), part))
+            if part:
+                asked += " (picture attached)"
             ss.answers[("well", well, "last_q")] = asked
 
         ans = ss.answers.get(("well", well, "last"))
@@ -600,7 +771,7 @@ if page == "Well copilot":
             with st.chat_message("user"):
                 st.markdown(last_q)
             with st.chat_message("assistant"):
-                st.markdown(ans)
+                st.markdown(clean(ans))
                 saved_note(("well", well, "last"))
             feedback_box("Well copilot", well, last_q, ans)
 
@@ -624,7 +795,7 @@ if page == "Well copilot":
         debate = ss.answers.get(("debate", well, "debate"))
         if debate:
             with st.container(border=True):
-                st.markdown(debate)
+                st.markdown(clean(debate))
                 saved_note(("debate", well, "debate"))
             feedback_box("Debate", well, "Debate", debate)
             ev =safe(lambda: api.evidence(well, test_mode=blind), "") or ""
@@ -635,15 +806,16 @@ if page == "Well copilot":
         with st.expander("Evidence the AI used"):
             ev = safe(lambda: api.evidence(well, test_mode=blind))
             if ev:
-                st.code(ev, language=None)
+                st.code(clean(ev), language=None)
             else:
                 st.info("Evidence not available.")
 
-        with st.expander("Human vs code"):
+        with st.expander("Geoscientist vs code"):
             h, c = st.columns(2)
-            h.markdown("**Team B (human interpretation)**")
-            for col in ["teamB_trap", "teamB_confidence", "teamB_family", "teamB_use"]:
-                h.markdown(f"- {col}: {val(row, col)}")
+            h.markdown("**Geoscientist interpretation**")
+            for col, label in [("teamB_trap", "Trap"), ("teamB_confidence", "Confidence"),
+                               ("teamB_family", "Family"), ("teamB_use", "Used as")]:
+                h.markdown(f"- {label}: {clean(str(val(row, col)))}")
             c.markdown("**Code trap test**")
             for col in ["code_verdict", "closure_ms", "anomaly_edge_std_ms", "anomaly_inside_closure_pct",
                         "t2_nearest_fault_m", "t2_nearest_fault_dir", "t2_contact",
@@ -652,7 +824,18 @@ if page == "Well copilot":
 
         with st.expander("All columns for this well"):
             if row is not None:
-                st.dataframe(row.to_frame("value").astype(str), use_container_width=True)
+                _r = row.rename(index=clean).astype(str).map(clean) if hasattr(row, "map") else row.astype(str)
+                st.dataframe(_r.to_frame("value"), use_container_width=True)
+
+        # Well data for all analysed wells
+        with st.expander("Well data: logs, sands, fluids and ties for all analysed wells"):
+            show_image(os.path.join(IMAGES, "well_panel.png"), "Logs, sands, fluids and contacts for all wells")
+            tie_cols = [c for c in ["tie_method", "tie_ms", "tie_corr", "checkshot", "moved_from_wellhead_m"]
+                        if c in wells_df.columns]
+            if tie_cols:
+                st.dataframe(wells_df[tie_cols], use_container_width=True)
+            st.caption("New wells: add LAS, checkshot and deviation files to the project folder and re-run the "
+                       "pipeline; the app reads the result. To look at a LAS file now, use the Seismic viewer.")
 
         report_button(f"copilot_{well}", [
             f"# Exploration Copilot report: {well}",
@@ -664,7 +847,7 @@ if page == "Well copilot":
         ], key=f"dl_{well}")
 
 # ---------------------------------------------------------------- 3. WHERE ELSE?
-if page == "Where else?":
+if page == "Similar traps":
     st.markdown("Similar traps yet to be tested, found by screening the whole survey.")
     show_image(os.path.join(IMAGES, "survey_bodies.png"), width=650)
 
@@ -696,7 +879,7 @@ if page == "Where else?":
         sim = ss.answers.get(("where", dw, "similar"))
         if sim:
             with st.container(border=True):
-                st.markdown(sim)
+                st.markdown(clean(sim))
                 saved_note(("where", dw, "similar"))
             feedback_box("Where else?", dw, "Find look-alikes", sim)
             follow_up(f"where_{dw}", "Find look-alikes", sim,
@@ -733,174 +916,16 @@ if page == "Leads to mature":
     lead_ans = ss.answers.get(("leads", "-", "ai"))
     if lead_ans:
         with st.container(border=True):
-            st.markdown(lead_ans)
+            st.markdown(clean(lead_ans))
             saved_note(("leads", "-", "ai"))
         feedback_box("Leads", "-", "Which leads should we mature first?", lead_ans)
         follow_up("leads", "Which leads should we mature first?", lead_ans,
                   lambda q, h: api.followup(lead_ans + "\n\n" + recommendation, q, h),
                   build=lambda q, h, img: build_followup(lead_ans + "\n\n" + recommendation, q, h))
     if recommendation:
-        st.markdown(recommendation)
+        st.markdown(clean(without_evidence(recommendation)))
     else:
         st.info("Recommendation not available.")
-
-# ---------------------------------------------------------------- 5. HOW WE CHECKED THE AI
-if page == "How we checked the AI":
-    lookback = ""
-    for para in recommendation.split("\n\n"):
-        if "look-back" in para.lower() or "lookback" in para.lower() or "blind" in para.lower():
-            lookback = para.strip()
-            break
-    show_image(os.path.join(IMAGES, "lookback.png"))
-    if lookback:
-        st.caption(lookback.replace("#", "").strip())
-
-    st.subheader("QC principles")
-    st.markdown(
-        "- **Evidence only:** every answer cites numbered evidence like [E4]; no evidence, no claim.\n"
-        "- **Two confidences:** how good the evidence is, and how sure the trap type is, shown separately.\n"
-        "- **Two-point trap test:** the code tests every survey body from two points and keeps only calls that agree.\n"
-        "- **Kill criteria are fixed rules, not AI:** the checklist that rejects a lead is geoscience rules in code.")
-
-    st.warning("**Limitations:** thin pays under about 10 m are below seismic reliability. There are no sonic "
-               "or density logs, so well ties use the sand pattern. Image-only answers stay at MEDIUM confidence at most.")
-
-    st.subheader("Human-in-the-loop: geoscientist feedback on AI answers")
-    try:
-        fb = pd.read_csv(FEEDBACK_CSV)
-        n_a, n_d = int((fb.verdict == "Agree").sum()), int((fb.verdict == "Disagree").sum())
-        f1, f2, f3 = st.columns(3)
-        f1.metric("Answers reviewed", len(fb), border=True)
-        f2.metric("Agree", n_a, border=True)
-        f3.metric("Disagree", n_d, border=True)
-        with st.expander("All feedback"):
-            st.dataframe(fb[["time", "tab", "well", "question", "verdict", "comment"]],
-                         use_container_width=True, hide_index=True)
-    except Exception:
-        st.info("No feedback yet. Use the Agree / Disagree buttons under any AI answer.")
-
-    # ----- Team C trap library: can the AI learn from examples? -----
-    st.subheader("Can the AI learn from examples? (Team C trap library)")
-    teamc = safe(lambda: CopilotAPI.trap_examples(TEAMC_DIR), []) or []
-    if not teamc:
-        st.info("Team C library not available.")
-    else:
-        st.caption(f"In-context learning, not training: the AI is shown labelled examples in the prompt. "
-                   f"With {len(teamc)} images the score is indicative only. Images are figures from a published "
-                   f"paper, not competition data.")
-        with st.expander(f"Gallery: {len(teamc)} labelled examples (raw and marked by a geoscientist)"):
-            for ex in teamc:
-                g1, g2, g3 = st.columns([2, 2, 1.4])
-                g1.image(ex["image"], caption=f"{ex['name']}: raw", use_container_width=True)
-                if ex.get("marked"):
-                    g2.image(ex["marked"], caption=f"{ex['name']}: trap marked", use_container_width=True)
-                g3.markdown(f"**{ex['label'].capitalize()}**\n\n{ex['note']}")
-        if st.button("Test the AI on Team C's images", key="teamc_test",
-                     help="Each image is classified twice: without examples, then with 3 other labelled examples. "
-                          "Takes 1-3 minutes."):
-            with st.spinner(f"Classifying {len(teamc)} images twice each..."):
-                try:
-                    T, acc = api.image_test(teamc)
-                    os.makedirs(os.path.dirname(TEAMC_RESULT), exist_ok=True)
-                    with open(TEAMC_RESULT, "w") as f:
-                        json.dump({"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "acc": acc,
-                                   "table": T.to_dict("records")}, f)
-                except Exception:
-                    st.error("The AI is busy right now. Please try again in a moment.")
-        res = safe(lambda: json.load(open(TEAMC_RESULT)))
-        if res:
-            acc = res.get("acc", {})
-            n0, n1 = acc.get("no_examples"), acc.get("with_examples")
-            r1, r2 = st.columns(2)
-            r1.metric("Accuracy without examples", f"{n0:.0%}" if n0 is not None else "n/a", border=True)
-            r2.metric("Accuracy with 3 examples", f"{n1:.0%}" if n1 is not None else "n/a",
-                      f"{(n1 - n0) * 100:+.0f} points" if n0 is not None and n1 is not None else None, border=True)
-            T = pd.DataFrame(res.get("table", []))
-            cols = [c for c in ["name", "true_label", "no_examples", "with_examples"] if c in T.columns]
-            if cols:
-                st.dataframe(T[cols], use_container_width=True, hide_index=True)
-            with st.expander("The AI's answers"):
-                for r in res.get("table", []):
-                    st.markdown(f"**{r.get('name')}** (true: {r.get('true_label')})  \n"
-                                f"Without examples: {r.get('no_examples_answer', '')}  \n"
-                                f"With examples: {r.get('with_examples_answer', '')}")
-            st.caption(f"Last run: {res.get('time', '')}. Leave-one-out: the image being tested is never one "
-                       f"of its own examples.")
-
-    st.subheader("Well data: the 13 analysed wells")
-    show_image(os.path.join(IMAGES, "well_panel.png"), "Logs, sands, fluids and contacts for all wells")
-    tie_cols = [c for c in ["tie_method", "tie_ms", "tie_corr", "checkshot", "moved_from_wellhead_m"]
-                if c in wells_df.columns]
-    if tie_cols:
-        st.dataframe(wells_df[tie_cols], use_container_width=True)
-    st.caption("New wells: add LAS, checkshot and deviation files to the project folder and re-run the "
-               "pipeline; the app reads the result.")
-
-    # ----- LAS curve viewer (displayed, not interpreted) -----
-    with st.expander("Look at a LAS file (displayed, not interpreted)"):
-        st.caption("Plots the curves of any LAS file. The copilot's well verdicts come only from the pipeline "
-                   "(deviation, tie, sands, contacts); an uploaded file is displayed, not interpreted.")
-        las_up = st.file_uploader("Upload a LAS file", type=["las", "LAS"], key="las_up")
-        if las_up is not None:
-            las_info = load_las(las_up.name, las_up.getvalue())
-            if las_info is None:
-                st.error("Couldn't read this file as LAS.")
-            else:
-                df, meta = las_info
-                curves = [c for c in df.columns]
-                pref = [c for c in PREFERRED_CURVES if c in curves]
-                pick = st.multiselect("Curves to show (up to 6)", curves, default=(pref or curves)[:5],
-                                      max_selections=6, key=f"las_pick_{las_up.name}")
-                st.markdown(f"**{meta['well']}** · depth {meta['start']:g}-{meta['stop']:g} {meta['unit']} · "
-                            f"{len(curves)} curves")
-                if pick:
-                    st.plotly_chart(las_figure(df, pick, meta), use_container_width=True)
-
-                las_ctx = (f"LAS file '{las_up.name}' (displayed only, not interpreted by the pipeline). "
-                           f"Well: {meta['well']}. Depth {meta['start']:g} to {meta['stop']:g} {meta['unit']}, "
-                           f"step {meta['step']}. Curves (name, unit, description): "
-                           + "; ".join(f"{c} ({meta['units'].get(c, '')}, {meta['descr'].get(c, '')})" for c in curves)
-                           + ". Only the curve list and depth range are given here, not the values.")
-                las_key = ("las", las_up.name, "ans")
-                lq_cols = st.columns(2)
-                las_q = None
-                for col, text in zip(lq_cols, ["What can these curves tell us about the reservoir?",
-                                               "Which curves are missing for a full interpretation?"]):
-                    if col.button(text, use_container_width=True, key=f"lasq_{text}"):
-                        las_q = text
-                if las_q:
-                    ss.answers[("las", las_up.name, "q")] = las_q
-                    run_ai(las_key, lambda: api.followup(las_ctx, las_q, []),
-                           build=lambda img: build_followup(las_ctx, las_q, []))
-                las_ans = ss.answers.get(las_key)
-                if las_ans:
-                    with st.container(border=True):
-                        st.markdown(las_ans)
-                    feedback_box("LAS viewer", meta["well"], ss.answers.get(("las", las_up.name, "q")), las_ans)
-                    follow_up(f"las_{las_up.name}", ss.answers.get(("las", las_up.name, "q")), las_ans,
-                              lambda q, h: api.followup(las_ctx, q, h),
-                              build=lambda q, h, img: build_followup(las_ctx, q, h))
-
-    with st.expander("Glossary (for non-geoscientists)"):
-        g = knowledge.get("glossary")
-        if isinstance(g, dict):
-            for term, meaning in g.items():
-                st.markdown(f"- **{term}:** {meaning}")
-        elif isinstance(g, list):
-            for item in g:
-                st.markdown(f"- {item}")
-        elif g:
-            st.markdown(str(g))
-        else:
-            st.info("Glossary not available.")
-
-    with st.expander("Test questions used to check the AI"):
-        tests = knowledge.get("tests")
-        if isinstance(tests, list) and tests:
-            for t in tests:
-                st.markdown(f"- {t if not isinstance(t, dict) else json.dumps(t)}")
-        else:
-            st.info("Test questions not available.")
 
 # ---------------------------------------------------------------- 6. SEISMIC VIEWER
 if page == "Seismic viewer":
@@ -909,4 +934,6 @@ if page == "Seismic viewer":
     except Exception as e:
         st.error(f"The seismic viewer could not start: {e}")
     else:
-        seismic_tab.render(api, feedback_box, live_answer)
+        seismic_tab.render(api, feedback_box, live_answer, clean=clean, image_part=image_part)
+    st.divider()
+    las_section()

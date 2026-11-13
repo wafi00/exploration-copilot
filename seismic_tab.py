@@ -1,6 +1,6 @@
 """Tab 6 of app.py: Seismic viewer and 'Ask the AI about this point'.
 
-Viewer code (crop, top view, 3D aerial view, upload, bright spots, AI trap boxes) comes from the
+Viewer code (crop, map view, 3D view, upload, bright spots, AI trap boxes) comes from the
 Seismic AI Lab in copilot/exploration-copilot. The AI call goes through CopilotAPI.ask_section, with
 measured [V] evidence from copilot_extras.point_evidence for the competition volumes.
 """
@@ -80,7 +80,7 @@ def _evidence_engine():
     cp = cpl.Copilot()
     cp.load_seismic()
     cx.load_state(cp)
-    try:                                   # same set-up as copilot_app.py: Team B knowledge adds its well table
+    try:                                   # same set-up as copilot_app.py: the field knowledge adds its well table
         if hasattr(cp, "sands"):           # and notes to the evidence at a point
             cx.install(cp)
         import copilot_knowledge as ck
@@ -91,7 +91,7 @@ def _evidence_engine():
 
 
 def _knowledge(competition):
-    """Team B's Knowledge Pack text (from the 'training'). Field calibration only fits the competition survey."""
+    """The field knowledge pack (from the 'training'). Field calibration only fits the competition survey."""
     try:
         import copilot_knowledge as ck
         if competition:
@@ -152,6 +152,17 @@ def _views_png(il_pack, xl_pack, slice_pack, point, spots=()):
     fig.savefig(buf, format="png", dpi=90)
     plt.close(fig)
     return buf.getvalue()
+
+
+def _add_picture(msgs, part):
+    """The user's own picture goes with the question, after the seismic view."""
+    if part is None:
+        return msgs
+    msgs = [dict(m) for m in msgs]
+    c = msgs[-1]["content"]
+    msgs[-1]["content"] = (list(c) if isinstance(c, list) else [{"type": "text", "text": str(c)}]) + [
+        {"type": "text", "text": "The user also attached this picture:"}, part]
+    return msgs
 
 
 def _section_messages(api, image, question, desc, evidence, history, examples):
@@ -298,7 +309,7 @@ def _highlight_section(fig, data, pos, ts, sand_pack, bright_pct, sand_cut):
 
 
 def _overlay_points(fig, pts, keep, values, colorscale, zmin, zmax, size, name):
-    """Extra coloured squares on the top view, just above the seismic (under lines, wells and the star)."""
+    """Extra coloured squares on the map view, just above the seismic (under lines, wells and the star)."""
     if not np.any(keep):
         return fig
     fig.add_trace(go.Scattergl(x=pts["x"][keep], y=pts["y"][keep], mode="markers", name=name, hoverinfo="skip",
@@ -321,7 +332,8 @@ CAND_RULE = ("\n\nAt the very end, add one line that starts with CANDIDATES: fol
              "you identified on panel B or C, in the same format as before, or CANDIDATES: []")
 
 
-def render(api, feedback=None, live=None):
+def render(api, feedback=None, live=None, clean=None, image_part=None):
+    clean = clean or (lambda t: t)
     ss = st.session_state
     ss.setdefault("extra_paths", [])
     ss.setdefault("lab_chat", [])      # {"role", "content" (shown), "sent" (sent to the AI), "cands"}
@@ -454,8 +466,8 @@ def render(api, feedback=None, live=None):
         st.number_input(f"Map time (ms, {ct0} to {ct1})", min_value=ct0, max_value=ct1, step=dt, key="map_t")
 
         with st.expander("Display settings", expanded=False):
-            dot = st.slider("Top view: dot size", 2, 12, 5)
-            z_stretch = st.slider("Aerial view: wall height", 0.2, 1.5, 0.5, 0.1)
+            dot = st.slider("Map view: dot size", 2, 12, 5)
+            z_stretch = st.slider("3D view: wall height", 0.2, 1.5, 0.5, 0.1)
             sensitivity = st.slider("Bright-spot sensitivity (lower = finds more)", 1.2, 5.0, 2.0, 0.1)
 
     il, xl, map_t = ss.il, ss.xl, ss.map_t
@@ -526,7 +538,7 @@ def render(api, feedback=None, live=None):
             if hl_sand and sand_path:
                 legend.append(f"**Green** = sand probability above {ss.hl_sand_cut:.2f}")
             if legend:
-                st.caption(" · ".join(legend) + ". Shown on the top view and both sections.")
+                st.caption(" · ".join(legend) + ". Shown on the map view and both sections.")
 
         sand_il = sand_xl = sand_pts = sand_slice = None
         if hl_sand and sand_path:
@@ -538,9 +550,10 @@ def render(api, feedback=None, live=None):
                 st.caption("Sand probability isn't available at this position.")
         cut_b = _bright_cut(pts["v"] if pts is not None else slice_pack[0], ss.hl_pct) if hl_bright else None
 
-        view = st.radio("View", ["Top view", "Aerial view (3D)"], horizontal=True,
-                        label_visibility="collapsed", key="lab_view")
-        top = view == "Top view"
+        if ss.get("lab_view") not in ("Map view", "3D view"):
+            ss.lab_view = "Map view"
+        view = st.radio("View", ["Map view", "3D view"], horizontal=True, label_visibility="collapsed", key="lab_view")
+        top = view == "Map view"
 
         def to_xy(IL, XL):
             (a0, a1, a2), (b0, b1, b2) = cf
@@ -560,6 +573,7 @@ def render(api, feedback=None, live=None):
                 fig = _overlay_points(fig, sand_pts, sv >= ss.hl_sand_cut, sv, SAND_SCALE, ss.hl_sand_cut, 1.0,
                                       dot, "Sand probability")
             fig = add_findings_to_map(fig, spots_now, ss.cands, cf)
+            fig.update_layout(title=f"Map view: time slice at {t_used:.0f} ms")
             st.caption("Click anywhere on the map to move there. The red star is the point the AI is asked about.")
             event = st.plotly_chart(fig, use_container_width=True, key="lab_top",
                                     on_select="rerun", selection_mode="points")
@@ -593,9 +607,10 @@ def render(api, feedback=None, live=None):
                     st.rerun()
         elif cf is not None:
             st.caption("Drag to rotate, scroll to zoom. Move the slices with the controls on the left."
-                       + (" Colour highlights show on the top view and the sections." if (hl_bright or hl_sand) else ""))
-            st.plotly_chart(aerial_figure(slice_pack, il_pack, xl_pack, cf, wxy, crop_t, colours, z_stretch),
-                            use_container_width=True, key="lab_3d")
+                       + (" Colour highlights show on the map view and the sections." if (hl_bright or hl_sand) else ""))
+            f3d = aerial_figure(slice_pack, il_pack, xl_pack, cf, wxy, crop_t, colours, z_stretch)
+            f3d.update_layout(title=f"3D view: inline {il_used}, crossline {xl_used}, time slice {t_used:.0f} ms")
+            st.plotly_chart(f3d, use_container_width=True, key="lab_3d")
         else:
             st.info("The 3D view needs real-world X/Y in the trace headers, and this volume has none.")
 
@@ -648,18 +663,21 @@ def render(api, feedback=None, live=None):
 
     examples = None
     if os.path.isfile(os.path.join(TEAMC_DIR, "labels.csv")):
-        if st.checkbox("Use Team C examples", key="lab_teamc"):
+        if st.checkbox("Learn from labelled trap examples", key="lab_examples",
+                       help="Shows the AI three labelled pictures of real traps before it answers."):
             try:
                 examples = type(api).trap_examples(TEAMC_DIR)[:3]
             except Exception:
-                st.caption("Team C examples could not be loaded.")
+                st.caption("The labelled examples could not be loaded.")
 
     for i, msg in enumerate(ss.lab_chat):
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            st.markdown(clean(msg["content"]))
+            if msg.get("img"):
+                st.image(msg["img"], width=260)
             if msg.get("evidence"):
                 with st.expander("Evidence at the point"):
-                    st.code(msg["evidence"], language=None)
+                    st.code(clean(msg["evidence"]), language=None)
             if msg["role"] == "assistant" and msg.get("cands"):
                 st.markdown("**Features marked on the sections** (red dashed boxes, red lines on the map):")
                 for c in msg["cands"]:
@@ -667,7 +685,7 @@ def render(api, feedback=None, live=None):
                     where = (f"inline {c['line']}, crosslines {c['from']:.0f}-{c['to']:.0f}" if c["panel"] == "inline"
                              else f"crossline {c['line']}, inlines {c['from']:.0f}-{c['to']:.0f}")
                     a.markdown(f"**{c['id']}: {c['type']}** ({c['confidence']} confidence): {where}, "
-                               f"{c['t_from']:.0f}-{c['t_to']:.0f} ms. {c['reason']}")
+                               f"{c['t_from']:.0f}-{c['t_to']:.0f} ms. {clean(c['reason'])}")
                     if b.button("Go", key=f"go_{i}_{c['id']}"):
                         mid_x, mid_t = (c["from"] + c["to"]) / 2, (c["t_from"] + c["t_to"]) / 2
                         ss.map_jump = (c["line"], mid_x) if c["panel"] == "inline" else (mid_x, c["line"])
@@ -689,10 +707,20 @@ def render(api, feedback=None, live=None):
                               "Explain the bright spots and the risks."]):
         if col.button(text, use_container_width=True, key=f"lab_q_{text}"):
             q = text
+    user_pic = None
     with st.form("lab_form", clear_on_submit=True):
         typed_q = st.text_input("Your question", placeholder="e.g. Is there a fault trap on this inline?")
+        pic_up = st.file_uploader("Add a picture for the AI to look at (optional)", type=["png", "jpg", "jpeg"],
+                                  key="lab_pic")
         if st.form_submit_button("Ask") and typed_q.strip():
             q = typed_q.strip()
+            user_pic = pic_up
+    user_part, user_bytes = None, None
+    if user_pic is not None and image_part is not None:
+        try:
+            user_part, user_bytes = image_part(user_pic), user_pic.getvalue()
+        except Exception:
+            st.warning("That picture couldn't be read, so the question is sent without it.")
 
     if q:
         if not spots_now:
@@ -704,7 +732,7 @@ def render(api, feedback=None, live=None):
         first = not ss.lab_chat
         if first:
             kb = _knowledge(competition)
-            sent = ((f"TEAM B KNOWLEDGE (use it to interpret what you see):\n{kb}\n\n" if kb else "")
+            sent = ((f"FIELD KNOWLEDGE (use it to interpret what you see):\n{kb}\n\n" if kb else "")
                     + build_prompt(q, il_used, xl_used, t_used, spots_now)
                     + "\nThe magenta cross on all three panels marks the selected point. "
                       "Cite the measured EVIDENCE lines like [V2] whenever you use them.")
@@ -729,8 +757,11 @@ def render(api, feedback=None, live=None):
             if live is not None:
                 with st.chat_message("user"):
                     st.markdown(q)
+                    if user_bytes:
+                        st.image(user_bytes, width=260)
                 with st.chat_message("assistant"):
-                    raw = live(lambda img: _section_messages(api, png, sent, desc, evidence, history, examples),
+                    raw = live(lambda img: _add_picture(_section_messages(api, png, sent, desc, evidence, history,
+                                                                          examples), user_part),
                                lambda: api.ask_section(png, sent, desc, evidence, history=history or None,
                                                        examples=examples),
                                max_tokens=1400, hide="CANDIDATES:")
@@ -747,6 +778,8 @@ def render(api, feedback=None, live=None):
             c["id"] = f"T{start + k}"
             c["line"] = il_used if c["panel"] == "inline" else xl_used
         ss.cands = ss.cands + cands
-        ss.lab_chat.append({"role": "user", "content": q, "sent": sent, "evidence": evidence})
-        ss.lab_chat.append({"role": "assistant", "content": answer or "(no answer)", "sent": raw, "cands": cands})
+        ss.lab_chat.append({"role": "user", "content": q + (" (picture attached)" if user_bytes else ""),
+                            "sent": sent, "evidence": evidence, "img": user_bytes})
+        ss.lab_chat.append({"role": "assistant", "content": clean(answer) if answer else "(no answer)", "sent": raw,
+                            "cands": cands})
         st.rerun()
