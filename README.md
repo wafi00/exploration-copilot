@@ -17,13 +17,21 @@ leads by risked area** (chance of gas from a blind look-back x area). Every answ
    cached demo answers (made on the HPC; competition data, not in this repo).
 3. **`copilot_api.py`**: the only interface between the app and the data / AI (ask, chat, debate,
    similar_to, followup, ask_section, trap_examples, image_test).
-4. **`app.py`** (Streamlit) + **Gemma 4** served with vLLM on the HPC.
-   Sections: Field overview, Well copilot, Where else?, Leads to mature, How we checked the AI,
-   Seismic viewer (`seismic_tab.py`, using `plots.py`, `viewer.py`, `seismic_ai.py`).
+4. **`app.py`** (Streamlit) + **Gemma 4** served with vLLM on the HPC. Five sections:
+   - **Seismic viewer** (`seismic_tab.py`, using `plots.py`, `viewer.py`, `seismic_ai.py`): map view, 3D view,
+     inline and crossline, crop, bright-amplitude and sand-probability highlights, ask the AI about any point;
+     well-log (LAS) upload with curve plots and questions.
+   - **Field overview**: every well's trap verdict and trust level, the whole-survey map.
+   - **Well copilot**: verdict card, one-click questions, debate, the evidence the AI used, well data.
+   - **Similar traps**: undrilled look-alikes of a discovery with a rule-based checklist.
+   - **Leads to mature**: leads ranked by risked area and the written recommendation.
 
-Gemma's weights are not changed: the copilot learns **in context** (Team B's reasoning steps, field
-calibration, trap catalogue and worked examples on every request; Team C's labelled trap images as
-examples).
+   Every chat box accepts a picture for Gemma to look at, and the sidebar sets the AI's tone (expert
+   geoscientist, plain English, executive summary, teacher, quick answer).
+
+Gemma's weights are not changed: the copilot learns **in context** (the geoscientists' reasoning steps, field
+calibration, trap catalogue and worked examples on every request; labelled trap images from a published paper
+as examples).
 
 ## How to run (on the HPC)
 
@@ -56,6 +64,6 @@ Keep **Demo mode** on for a live demo: cached answers appear instantly.
 ## Team
 
 <!-- Fill in: name - role -->
-- Team A (code): ...
-- Team B (interpretation): ...
-- Team C (trap image library): ...
+- Code and app: ...
+- Seismic and well interpretation: ...
+- Trap image library: ...
